@@ -1,0 +1,7 @@
+[project]
+name = "moody"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "esptool>=5.3.1",
+]
