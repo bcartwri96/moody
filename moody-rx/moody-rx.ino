@@ -1,9 +1,16 @@
 #include <Arduino.h>
+
+#if !defined(CONFIG_IDF_TARGET_ESP32)
+#error "moody-rx requires classic ESP32 (Waveshare ESP32-Touch-LCD-3.5)"
+#endif
 #include <WiFi.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <Arduino_GFX_Library.h>
 #include <JPEGDEC.h>
 #include <TCA9554.h>
+#include <driver/i2s_std.h>
+#include "src/es8311/es8311.h"
 #include "esp_log.h"
 
 #include "freertos/FreeRTOS.h"
@@ -17,9 +24,14 @@
 #include "mbedtls/pk.h"
 
 #include "frame_fifo.h"
+#include "audio_stream.h"
+#include "audio_playback_format.h"
+#include "board_pins.h"
 #include "moody_keys.h"
 #include "timing_stats.h"
+#include "touch_ft6336.h"
 #include "video_layout.h"
+#include "volume_control.h"
 
 // Dedicated moody-tx network. These must exactly match moody-tx.ino.
 static const char *TX_AP_SSID = "moody-camera";
@@ -27,46 +39,58 @@ static const char *TX_AP_PASSWORD = "CHANGE-ME-9274";
 static const IPAddress TX_ADDRESS(192, 168, 4, 1);
 static constexpr uint16_t TX_PORT = 3333;
 
-// Classic Waveshare ESP32-Touch-LCD-3.5 pin map.
-#define LCD_BACKLIGHT 25
-#define LCD_DC        27
-#define LCD_CS         5
-#define LCD_SCK       18
-#define LCD_MOSI      23
-#define LCD_MISO      19
-#define I2C_SDA       21
-#define I2C_SCL       22
-
 static constexpr uint32_t IO_TIMEOUT_MS = 5000;
 static constexpr uint32_t WIFI_ATTEMPT_MS = 12000;
 static constexpr uint32_t RETRY_DELAY_MS = 2000;
 static constexpr size_t MAX_JPEG_SIZE = 128 * 1024;
 static constexpr size_t MAX_SIGNATURE_SIZE = 96;
 static constexpr uint8_t JPEG_SLOT_COUNT = 2;
+static constexpr uint8_t AUDIO_QUEUE_LENGTH = 4;
+static constexpr uint32_t STREAM_READER_STACK_BYTES = 8192;
 static constexpr uint16_t DISPLAY_WIDTH = 480;
 static constexpr uint16_t DISPLAY_HEIGHT = 320;
-// The classic ESP32's DMA driver tops out below 26.7 MHz, but this display's
-// non-DMA bus is stable at 80 MHz and halves full-frame transfer time.
+// Preserve the classic board's working non-DMA 80 MHz display bus.
 static constexpr uint32_t LCD_SPI_HZ = 80000000;
+static constexpr uint32_t AUDIO_SAMPLE_RATE_HZ = 16000;
+static constexpr uint32_t AUDIO_MCLK_MULTIPLE = 256;
+static constexpr uint32_t AUDIO_MCLK_FREQUENCY_HZ =
+  AUDIO_SAMPLE_RATE_HZ * AUDIO_MCLK_MULTIPLE;
+static constexpr uint32_t AUDIO_BLOCK_SAMPLES = 320;
+static constexpr uint32_t AUDIO_BLOCK_BYTES = AUDIO_BLOCK_SAMPLES * sizeof(int16_t);
+static constexpr uint32_t AUDIO_WRITE_DEADLINE_MS = 30;
+static constexpr uint8_t DEFAULT_UI_VOLUME = 70;
+static constexpr uint32_t TOUCH_POLL_MS = 20;
+static constexpr uint32_t TOUCH_TASK_STACK_BYTES = 3072;
+static constexpr uint8_t TOUCH_TAP_QUEUE_LENGTH = 4;
+// Bounded so volume taps are serviced while waiting for the next frame.
+static constexpr uint32_t FRAME_WAIT_MS = 30;
+static_assert(AUDIO_BLOCK_BYTES == moody_audio::kAudioPayloadLength,
+              "I2S playback block must consume one complete PCM record");
 
 static const uint8_t TX_HELLO_MAGIC[8] = {'M','O','O','D','Y','T','X','1'};
 static const uint8_t RX_AUTH_MAGIC[8]  = {'M','O','O','D','Y','R','X','1'};
 static const uint8_t AUTH_OK_MAGIC[8]  = {'A','U','T','H','O','K','0','1'};
-static const uint8_t FRAME_MAGIC[4]    = {'M','J','P','G'};
 static const char TX_CONTEXT[] = "moody-tx-proof-v1";
 static const char RX_CONTEXT[] = "moody-rx-proof-v1";
 
-TCA9554 TCA(0x20);
+TCA9554 TCA(moody_rx::board::kTca9554Address);
 
 Arduino_DataBus *displayBus = new Arduino_ESP32SPI(
-  LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, LCD_MISO, VSPI
+  moody_rx::board::kDisplayDcPin,
+  moody_rx::board::kDisplayCsPin,
+  moody_rx::board::kDisplaySclkPin,
+  moody_rx::board::kDisplayMosiPin,
+  moody_rx::board::kDisplayMisoPin,
+  VSPI
 );
 
 Arduino_GFX *gfx = new Arduino_ST7796(
   displayBus,
-  GFX_NOT_DEFINED,
+  moody_rx::board::kDisplayResetPin,
   0,
-  true
+  true,
+  moody_rx::board::kDisplayNativeWidth,
+  moody_rx::board::kDisplayNativeHeight
 );
 
 WiFiClient streamClient;
@@ -85,12 +109,164 @@ struct FrameDescriptor {
   bool terminal;
 };
 
+struct AudioPcmRecord {
+  uint32_t timestamp;
+  uint8_t pcm[moody_audio::kAudioPayloadLength];
+};
+
+struct AudioQueueTelemetry {
+  uint32_t depth;
+  uint32_t fullDrops;
+  uint32_t contentionDrops;
+};
+
+class AudioPcmQueue {
+ public:
+  bool initialise() {
+    if (queue_ != nullptr || mutex_ != nullptr) return false;
+    queue_ = xQueueCreateStatic(AUDIO_QUEUE_LENGTH,
+                                sizeof(AudioPcmRecord),
+                                reinterpret_cast<uint8_t *>(records_),
+                                &queueStorage_);
+    if (queue_ == nullptr) return false;
+
+    mutex_ = xSemaphoreCreateMutex();
+    if (mutex_ == nullptr) {
+      queue_ = nullptr;
+      return false;
+    }
+    return true;
+  }
+
+  void clear() {
+    if (queue_ == nullptr || mutex_ == nullptr ||
+        xSemaphoreTake(mutex_, portMAX_DELAY) != pdPASS) {
+      return;
+    }
+    xQueueReset(queue_);
+    fullDrops_ = 0;
+    __atomic_store_n(&contentionDrops_, 0U, __ATOMIC_RELAXED);
+    xSemaphoreGive(mutex_);
+  }
+
+  bool enqueue(uint32_t timestamp,
+               const uint8_t pcm[moody_audio::kAudioPayloadLength]) {
+    if (queue_ == nullptr || mutex_ == nullptr) return false;
+    if (xSemaphoreTake(mutex_, 0) != pdPASS) {
+      __atomic_fetch_add(&contentionDrops_, 1U, __ATOMIC_RELAXED);
+      return false;
+    }
+
+    AudioPcmRecord record = {};
+    record.timestamp = timestamp;
+    memcpy(record.pcm, pcm, sizeof(record.pcm));
+    bool queued = xQueueSend(queue_, &record, 0) == pdTRUE;
+    if (!queued) {
+      AudioPcmRecord discarded = {};
+      if (xQueueReceive(queue_, &discarded, 0) == pdTRUE) {
+        ++fullDrops_;
+        queued = xQueueSend(queue_, &record, 0) == pdTRUE;
+      }
+    }
+    xSemaphoreGive(mutex_);
+    return queued;
+  }
+
+  bool dequeue(AudioPcmRecord &record, TickType_t wait) {
+    if (queue_ == nullptr || mutex_ == nullptr) return false;
+    if (wait == 0) return tryDequeue(record);
+
+    const TickType_t started = xTaskGetTickCount();
+    while (true) {
+      if (tryDequeue(record)) return true;
+      if (wait != portMAX_DELAY && xTaskGetTickCount() - started >= wait) {
+        return false;
+      }
+      vTaskDelay(1);
+    }
+  }
+
+  bool snapshot(AudioQueueTelemetry &telemetry) {
+    if (queue_ == nullptr || mutex_ == nullptr ||
+        xSemaphoreTake(mutex_, portMAX_DELAY) != pdPASS) {
+      return false;
+    }
+    telemetry.depth = static_cast<uint32_t>(uxQueueMessagesWaiting(queue_));
+    telemetry.fullDrops = fullDrops_;
+    xSemaphoreGive(mutex_);
+    telemetry.contentionDrops =
+      __atomic_load_n(&contentionDrops_, __ATOMIC_RELAXED);
+    return true;
+  }
+
+  bool takeTelemetry(AudioQueueTelemetry &telemetry) {
+    if (queue_ == nullptr || mutex_ == nullptr ||
+        xSemaphoreTake(mutex_, portMAX_DELAY) != pdPASS) {
+      return false;
+    }
+    telemetry.depth = static_cast<uint32_t>(uxQueueMessagesWaiting(queue_));
+    telemetry.fullDrops = fullDrops_;
+    fullDrops_ = 0;
+    xSemaphoreGive(mutex_);
+    telemetry.contentionDrops =
+      __atomic_exchange_n(&contentionDrops_, 0U, __ATOMIC_RELAXED);
+    return true;
+  }
+
+ private:
+  bool tryDequeue(AudioPcmRecord &record) {
+    if (xSemaphoreTake(mutex_, 0) != pdPASS) return false;
+    const bool dequeued = xQueueReceive(queue_, &record, 0) == pdTRUE;
+    xSemaphoreGive(mutex_);
+    return dequeued;
+  }
+
+  AudioPcmRecord records_[AUDIO_QUEUE_LENGTH];
+  StaticQueue_t queueStorage_ = {};
+  QueueHandle_t queue_ = nullptr;
+  SemaphoreHandle_t mutex_ = nullptr;
+  uint32_t fullDrops_ = 0;
+  uint32_t contentionDrops_ = 0;
+};
+
+struct PartialVideoFrame {
+  bool active;
+  uint8_t slot;
+  uint32_t frameId;
+  uint32_t txMillis;
+  uint32_t txClockOffsetMs;
+  uint32_t jpegLength;
+  uint32_t nextOffset;
+  uint32_t headerWaitUs;
+  uint32_t payloadStartedUs;
+};
+
 QueueHandle_t freeSlots = nullptr;
 QueueHandle_t readyFrames = nullptr;
 SemaphoreHandle_t fifoStateMutex = nullptr;
 SemaphoreHandle_t readerFinished = nullptr;
 FrameSlotFifo<JPEG_SLOT_COUNT> frameSlotFifo;
 bool streamReaderRunning = false;
+AudioPcmQueue audioPcmQueue;
+static i2s_chan_handle_t audioTxChannel = nullptr;
+static es8311_handle_t audioCodec = nullptr;
+static SemaphoreHandle_t audioPlaybackFinished = nullptr;
+static volatile bool audioPlaybackRunning = false;
+static bool audioI2cReady = false;
+static bool audioAmplifierReady = false;
+static bool audioQueueReady = false;
+moody_rx::Ft6336 touchPanel(Wire);
+moody_rx::VolumeControl volumeControl(DEFAULT_UI_VOLUME);
+// Landscape X of each new tap, produced by the touch task for loop().
+static QueueHandle_t touchTaps = nullptr;
+static uint8_t savedUiVolume = DEFAULT_UI_VOLUME;
+Preferences settings;
+PartialVideoFrame partialVideoFrame = {};
+bool hasExpectedRecordSequence = false;
+uint32_t expectedRecordSequence = 0;
+uint32_t droppedRecordCount = 0;
+bool hasTxClockOffset = false;
+uint32_t txClockOffsetMs = 0;
 
 mbedtls_entropy_context entropy;
 mbedtls_ctr_drbg_context ctrDrbg;
@@ -117,13 +293,6 @@ alignas(4) uint8_t scaledJpegBlock[DISPLAY_WIDTH * 48 * 2];
 
 static uint16_t readU16BE(const uint8_t in[2]) {
   return (static_cast<uint16_t>(in[0]) << 8) | in[1];
-}
-
-static uint32_t readU32BE(const uint8_t in[4]) {
-  return (static_cast<uint32_t>(in[0]) << 24) |
-         (static_cast<uint32_t>(in[1]) << 16) |
-         (static_cast<uint32_t>(in[2]) << 8) |
-          static_cast<uint32_t>(in[3]);
 }
 
 static void writeU16BE(uint8_t out[2], uint16_t value) {
@@ -216,14 +385,294 @@ static bool initialiseCrypto() {
            strlen(MOODY_TX_PUBLIC_KEY_PEM) + 1) == 0;
 }
 
-static void resetLCD() {
-  TCA.pinMode1(0, OUTPUT);
-  TCA.write1(0, 1);
+static bool initialiseBoardIo() {
+  Wire.begin(moody_rx::board::kI2cSdaPin, moody_rx::board::kI2cSclPin);
+  pinMode(moody_rx::board::kDisplayBacklightPin, OUTPUT);
+  digitalWrite(moody_rx::board::kDisplayBacklightPin, LOW);
+  audioAmplifierReady = false;
+  if (!TCA.begin()) return false;
+
+  // P0 controls LCD reset, so its setup is display-critical. P2 is optional:
+  // keep its TCA default input state and disable audio if safe setup fails.
+  if (!TCA.pinMode1(moody_rx::board::kTcaLcdResetPin, OUTPUT)) return false;
+  audioI2cReady = true;
+
+  if (!TCA.write1(moody_rx::board::kTcaAmplifierEnablePin, LOW)) {
+    Serial.println("audio disabled: could not preload TCA9554 PA_CTRL LOW");
+    return true;
+  }
+  if (!TCA.pinMode1(moody_rx::board::kTcaAmplifierEnablePin, OUTPUT)) {
+    Serial.println("audio disabled: could not configure TCA9554 PA_CTRL output");
+    return true;
+  }
+  audioAmplifierReady = true;
+  return true;
+}
+
+static void stopAudioI2sDriver() {
+  if (audioTxChannel != nullptr) {
+    i2s_channel_disable(audioTxChannel);
+    i2s_del_channel(audioTxChannel);
+    audioTxChannel = nullptr;
+  }
+}
+
+static bool initialiseAudioCodec() {
+  if (!audioAmplifierReady) {
+    Serial.println("audio init failed at TCA9554 PA_CTRL: safe output unavailable");
+    return false;
+  }
+  if (!audioI2cReady) {
+    Serial.println("audio init failed at shared I2C: board bus unavailable");
+    return false;
+  }
+
+  audioCodec = es8311_create(I2C_NUM_0, ES8311_ADDRRES_0);
+  if (audioCodec == nullptr) {
+    Serial.println("audio init failed at ES8311 create/I2C");
+    return false;
+  }
+
+  const es8311_clock_config_t codecClock = {
+    .mclk_inverted = false,
+    .sclk_inverted = false,
+    .mclk_from_mclk_pin = false,
+    .mclk_frequency = static_cast<int>(AUDIO_MCLK_FREQUENCY_HZ),
+    .sample_frequency = static_cast<int>(AUDIO_SAMPLE_RATE_HZ),
+  };
+  esp_err_t err = es8311_init(audioCodec,
+                              &codecClock,
+                              ES8311_RESOLUTION_32,
+                              ES8311_RESOLUTION_32);
+  if (err != ESP_OK) {
+    Serial.printf("audio init failed at ES8311 init: %s\n", esp_err_to_name(err));
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    return false;
+  }
+  err = es8311_voice_volume_set(
+    audioCodec, moody_rx::codecVolumeFor(volumeControl.volume()), nullptr);
+  if (err == ESP_OK) err = es8311_microphone_config(audioCodec, false);
+  if (err != ESP_OK) {
+    Serial.printf("audio init failed at ES8311 DAC setup: %s\n", esp_err_to_name(err));
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    return false;
+  }
+
+  i2s_chan_config_t channelConfig =
+    I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  // Send silence instead of replaying old DMA buffers when PCM runs out.
+  channelConfig.auto_clear_after_cb = true;
+  err = i2s_new_channel(&channelConfig, &audioTxChannel, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("audio init failed at I2S channel allocation: %s\n", esp_err_to_name(err));
+    stopAudioI2sDriver();
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    return false;
+  }
+
+  i2s_std_config_t standardConfig = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE_HZ),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+      I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = static_cast<gpio_num_t>(moody_rx::board::kAudioMclkPin),
+      .bclk = static_cast<gpio_num_t>(moody_rx::board::kAudioBclkPin),
+      .ws = static_cast<gpio_num_t>(moody_rx::board::kAudioLrckPin),
+      .dout = static_cast<gpio_num_t>(moody_rx::board::kAudioDataOutPin),
+      .din = I2S_GPIO_UNUSED,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv = false,
+      },
+    },
+  };
+  standardConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+  standardConfig.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+
+  err = i2s_channel_init_std_mode(audioTxChannel, &standardConfig);
+  if (err == ESP_OK) err = i2s_channel_enable(audioTxChannel);
+  if (err != ESP_OK) {
+    Serial.printf("audio init failed at I2S BCLK/TX setup: %s\n", esp_err_to_name(err));
+    stopAudioI2sDriver();
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    return false;
+  }
+
+  // PA_CTRL is active HIGH. Keep it LOW until codec and all I2S clocks work.
+  if (!TCA.write1(moody_rx::board::kTcaAmplifierEnablePin, HIGH)) {
+    Serial.println("audio init failed at TCA9554 PA_CTRL enable");
+    TCA.write1(moody_rx::board::kTcaAmplifierEnablePin, LOW);
+    stopAudioI2sDriver();
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    return false;
+  }
+
+  Serial.printf("audio codec ready: rate=%lu Hz internal MCLK=%lu Hz (from BCLK) stereo 32-bit\n",
+                static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ),
+                static_cast<unsigned long>(AUDIO_MCLK_FREQUENCY_HZ));
+  return true;
+}
+
+static void reportAudioStatus(bool ready) {
+  AudioQueueTelemetry telemetry = {};
+  if (audioPcmQueue.snapshot(telemetry)) {
+    if (ready) {
+      Serial.printf("audio=ready rate=%lu Hz queue=%lu/%u\n",
+                    static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ),
+                    static_cast<unsigned long>(telemetry.depth),
+                    static_cast<unsigned>(AUDIO_QUEUE_LENGTH));
+    } else {
+      Serial.printf("audio=disabled rate=%lu Hz queue=%lu/%u\n",
+                    static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ),
+                    static_cast<unsigned long>(telemetry.depth),
+                    static_cast<unsigned>(AUDIO_QUEUE_LENGTH));
+    }
+    return;
+  }
+  if (ready) {
+    Serial.printf("audio=ready rate=%lu Hz queue=unavailable/%u\n",
+                  static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ),
+                  static_cast<unsigned>(AUDIO_QUEUE_LENGTH));
+  } else {
+    Serial.printf("audio=disabled rate=%lu Hz queue=unavailable/%u\n",
+                  static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ),
+                  static_cast<unsigned>(AUDIO_QUEUE_LENGTH));
+  }
+}
+
+static void audioPlaybackTask(void *) {
+  AudioPcmRecord record = {};
+  uint32_t playbackSlots[AUDIO_BLOCK_SAMPLES * 2];
+  TickType_t lastReport = xTaskGetTickCount();
+  uint32_t blocks = 0;
+  uint32_t underruns = 0;
+  uint32_t shortWrites = 0;
+
+  while (audioPlaybackRunning) {
+    if (!audioPcmQueue.dequeue(record, pdMS_TO_TICKS(20))) {
+      ++underruns;
+    } else {
+      moody_audio::expandMono16LeToStereo32(record.pcm, AUDIO_BLOCK_SAMPLES, playbackSlots);
+      const uint8_t *playbackBytes = reinterpret_cast<const uint8_t *>(playbackSlots);
+      size_t writtenTotal = 0;
+      const uint32_t deadline = millis() + AUDIO_WRITE_DEADLINE_MS;
+      while (writtenTotal < sizeof(playbackSlots) && audioPlaybackRunning) {
+        if (static_cast<int32_t>(millis() - deadline) >= 0) break;
+        size_t written = 0;
+        const esp_err_t err = i2s_channel_write(
+          audioTxChannel,
+          playbackBytes + writtenTotal,
+          sizeof(playbackSlots) - writtenTotal,
+          &written,
+          0);
+        writtenTotal += written;
+        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) break;
+        // A DMA buffer takes 15 ms to drain. Retry partial writes within the
+        // block's deadline without restarting a blocking driver timeout.
+        if (writtenTotal < sizeof(playbackSlots)) vTaskDelay(1);
+      }
+      if (writtenTotal != sizeof(playbackSlots)) {
+        ++shortWrites;
+      } else {
+        ++blocks;
+      }
+    }
+
+    if (xTaskGetTickCount() - lastReport >= pdMS_TO_TICKS(5000)) {
+      AudioQueueTelemetry telemetry = {};
+      if (audioPcmQueue.takeTelemetry(telemetry)) {
+        Serial.printf(
+          "audio playback: blocks=%lu underruns=%lu short_writes=%lu "
+          "queue=%lu/%u drops_full=%lu drops_contended=%lu rssi_dbm=%ld\n",
+          static_cast<unsigned long>(blocks),
+          static_cast<unsigned long>(underruns),
+          static_cast<unsigned long>(shortWrites),
+          static_cast<unsigned long>(telemetry.depth),
+          static_cast<unsigned>(AUDIO_QUEUE_LENGTH),
+          static_cast<unsigned long>(telemetry.fullDrops),
+          static_cast<unsigned long>(telemetry.contentionDrops),
+          static_cast<long>(WiFi.RSSI()));
+      }
+      blocks = underruns = shortWrites = 0;
+      lastReport = xTaskGetTickCount();
+    }
+  }
+
+  xSemaphoreGive(audioPlaybackFinished);
+  vTaskDelete(nullptr);
+}
+
+static bool startAudioPlayback() {
+  if (audioPlaybackRunning) return true;
+  if (!audioQueueReady) {
+    Serial.println("audio playback disabled: PCM queue unavailable");
+    reportAudioStatus(false);
+    return false;
+  }
+  if (audioPlaybackFinished == nullptr || !initialiseAudioCodec()) {
+    reportAudioStatus(false);
+    return false;
+  }
+
+  audioPcmQueue.clear();
+  xSemaphoreTake(audioPlaybackFinished, 0);
+  audioPlaybackRunning = true;
+  const BaseType_t created = xTaskCreatePinnedToCore(
+    audioPlaybackTask, "audio-playback", 8192, nullptr, 3, nullptr, 0);
+  if (created != pdPASS) {
+    audioPlaybackRunning = false;
+    TCA.write1(moody_rx::board::kTcaAmplifierEnablePin, LOW);
+    stopAudioI2sDriver();
+    es8311_delete(audioCodec);
+    audioCodec = nullptr;
+    Serial.println("audio playback disabled: task creation failed");
+    reportAudioStatus(false);
+    return false;
+  }
+  Serial.println("audio playback enabled");
+  reportAudioStatus(true);
+  return true;
+}
+
+static void stopAudioPlayback() {
+  if (audioPlaybackRunning) {
+    audioPlaybackRunning = false;
+    xSemaphoreTake(audioPlaybackFinished, portMAX_DELAY);
+  }
+  audioPcmQueue.clear();
+  if (audioCodec != nullptr || audioTxChannel != nullptr) {
+    TCA.write1(moody_rx::board::kTcaAmplifierEnablePin, LOW);
+    stopAudioI2sDriver();
+    if (audioCodec != nullptr) {
+      es8311_delete(audioCodec);
+      audioCodec = nullptr;
+    }
+    Serial.println("audio playback stopped; PA_CTRL LOW");
+  }
+}
+
+static bool resetDisplay() {
+  if (!TCA.write1(moody_rx::board::kTcaLcdResetPin, HIGH)) return false;
   delay(10);
-  TCA.write1(0, 0);
+  if (!TCA.write1(moody_rx::board::kTcaLcdResetPin, LOW)) return false;
   delay(10);
-  TCA.write1(0, 1);
+  if (!TCA.write1(moody_rx::board::kTcaLcdResetPin, HIGH)) return false;
   delay(200);
+  return true;
+}
+
+static bool initialiseDisplay() {
+  if (!resetDisplay() || !gfx->begin(LCD_SPI_HZ)) return false;
+
+  gfx->setRotation(1);
+  digitalWrite(moody_rx::board::kDisplayBacklightPin, HIGH);
+  return true;
 }
 
 static void showStatus(const char *heading,
@@ -246,6 +695,114 @@ static void showStatus(const char *heading,
   gfx->setTextColor(RGB565_WHITE);
   gfx->setCursor(28, 165);
   gfx->println(detail);
+}
+
+// Polls the FT6336 independently of JPEG decode so short taps are not missed.
+// Only I2C reads happen here; loop() owns drawing and codec writes.
+static void touchPollTask(void *) {
+  moody_rx::TouchEdge edge;
+  moody_rx::TouchPoint point;
+  for (;;) {
+    if (touchPanel.read(point) && edge.pressed(point.touched)) {
+      const uint16_t rawY = point.rawY >= DISPLAY_WIDTH ? DISPLAY_WIDTH - 1 : point.rawY;
+      const uint16_t x = moody_rx::board::kTouchLandscapeXFlipped
+        ? static_cast<uint16_t>(DISPLAY_WIDTH - 1 - rawY)
+        : rawY;
+      Serial.printf("touch tap raw=%u,%u screen_x=%u\n",
+                    point.rawX, point.rawY, x);
+      xQueueSend(touchTaps, &x, 0);
+    }
+    vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
+  }
+}
+
+// Touch is optional: any failure leaves video and audio at the saved volume.
+static void initialiseTouchVolume() {
+  settings.begin("moody-rx", false);
+  savedUiVolume = settings.getUChar("volume", DEFAULT_UI_VOLUME);
+  volumeControl = moody_rx::VolumeControl(savedUiVolume);
+  savedUiVolume = volumeControl.volume();
+  Serial.printf("volume: restored %u%%\n", savedUiVolume);
+
+  if (!TCA.write1(moody_rx::board::kTcaTouchResetPin, LOW) ||
+      !TCA.pinMode1(moody_rx::board::kTcaTouchResetPin, OUTPUT)) {
+    Serial.println("touch disabled: could not drive TCA9554 TP_RST");
+    return;
+  }
+  delay(10);
+  TCA.write1(moody_rx::board::kTcaTouchResetPin, HIGH);
+  delay(300);  // FT6336 needs ~300 ms after reset before I2C.
+
+  uint8_t chipId = 0;
+  uint8_t vendorId = 0;
+  if (!touchPanel.readIds(chipId, vendorId)) {
+    Serial.println("touch disabled: FT6336 did not answer at 0x38");
+    return;
+  }
+  Serial.printf("touch: FT6336 chip=0x%02x vendor=0x%02x\n", chipId, vendorId);
+
+  touchTaps = xQueueCreate(TOUCH_TAP_QUEUE_LENGTH, sizeof(uint16_t));
+  if (touchTaps == nullptr ||
+      xTaskCreatePinnedToCore(touchPollTask, "moody-touch",
+                              TOUCH_TASK_STACK_BYTES, nullptr, 2,
+                              nullptr, 1) != pdPASS) {
+    Serial.println("touch disabled: could not start touch task");
+  }
+}
+
+static void drawVolumeOverlay() {
+  static constexpr int16_t kLeft = 90;
+  static constexpr int16_t kTop = 268;
+  static constexpr int16_t kWidth = 300;
+  static constexpr int16_t kHeight = 36;
+  static constexpr int16_t kBarLeft = kLeft + 60;
+  static constexpr int16_t kBarWidth = 150;
+  const uint8_t volume = volumeControl.volume();
+
+  gfx->fillRect(kLeft, kTop, kWidth, kHeight, RGB565_BLACK);
+  gfx->drawRect(kLeft, kTop, kWidth, kHeight, RGB565_DARKGREY);
+  gfx->setTextSize(2);
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setCursor(kLeft + 10, kTop + 11);
+  gfx->print("VOL");
+  const int16_t segment = kBarWidth / (moody_rx::VolumeControl::kMax /
+                                       moody_rx::VolumeControl::kStep);
+  for (uint8_t level = moody_rx::VolumeControl::kStep, i = 0;
+       level <= moody_rx::VolumeControl::kMax;
+       level += moody_rx::VolumeControl::kStep, ++i) {
+    const int16_t x = kBarLeft + i * segment;
+    const uint16_t colour = level <= volume ? RGB565_GREEN : RGB565_DARKGREY;
+    gfx->fillRect(x, kTop + 9, segment - 3, kHeight - 18, colour);
+  }
+  gfx->setCursor(kBarLeft + kBarWidth + 12, kTop + 11);
+  gfx->printf("%3u%%", volume);
+}
+
+// Applies queued taps and hides/saves the overlay. Called from loop() only,
+// so codec writes never race startAudioPlayback()/stopAudioPlayback().
+static void serviceVolumeTouch() {
+  if (touchTaps == nullptr) return;
+  uint16_t x = 0;
+  bool tapped = false;
+  while (xQueueReceive(touchTaps, &x, 0) == pdTRUE) {
+    volumeControl.onTap(x, DISPLAY_WIDTH, millis());
+    tapped = true;
+  }
+  if (tapped) {
+    if (audioCodec != nullptr) {
+      es8311_voice_volume_set(
+        audioCodec, moody_rx::codecVolumeFor(volumeControl.volume()), nullptr);
+    }
+    drawVolumeOverlay();
+  }
+  // The next video frame paints over the expired overlay; save only then so
+  // a burst of taps costs one flash write.
+  if (volumeControl.overlayExpired(millis()) &&
+      volumeControl.volume() != savedUiVolume) {
+    savedUiVolume = volumeControl.volume();
+    settings.putUChar("volume", savedUiVolume);
+    Serial.printf("volume: saved %u%%\n", savedUiVolume);
+  }
 }
 
 static bool joinTransmitterNetwork() {
@@ -500,10 +1057,150 @@ static bool releaseFrameSlot(uint8_t slot) {
   return queued;
 }
 
-static void finishStreamReader(bool slotHeld, uint8_t slot) {
-  if (slotHeld && !releaseFrameSlot(slot)) {
+static void resetConnectionReceiveState() {
+  if (partialVideoFrame.active && !releaseFrameSlot(partialVideoFrame.slot)) {
     Serial.println("Reader failed to return incomplete JPEG slot");
   }
+  partialVideoFrame = {};
+  audioPcmQueue.clear();
+  hasExpectedRecordSequence = false;
+  expectedRecordSequence = 0;
+  droppedRecordCount = 0;
+  hasTxClockOffset = false;
+  txClockOffsetMs = 0;
+}
+
+static bool beginVideoFrame(const moody_audio::RecordHeader &header,
+                            const uint8_t payload[8],
+                            uint32_t headerReceivedAtMs,
+                            uint32_t headerWaitUs) {
+  const uint32_t jpegLength = moody_audio::readU32BE(payload + 4);
+  if (partialVideoFrame.active ||
+      !moody_audio::validVideoFrameLength(
+        jpegLength, static_cast<uint32_t>(MAX_JPEG_SIZE))) {
+    Serial.printf("Invalid VIDEO_BEGIN JPEG length: %lu\n",
+                  static_cast<unsigned long>(jpegLength));
+    return false;
+  }
+
+  uint8_t slot = 0;
+  if (xQueueReceive(freeSlots, &slot, portMAX_DELAY) != pdTRUE ||
+      !markSlotAcquired(slot)) {
+    return false;
+  }
+
+  if (!hasTxClockOffset) {
+    txClockOffsetMs =
+      remoteToLocalCounterOffset(header.timestamp, headerReceivedAtMs);
+    hasTxClockOffset = true;
+  }
+
+  partialVideoFrame.active = true;
+  partialVideoFrame.slot = slot;
+  partialVideoFrame.frameId = moody_audio::readU32BE(payload);
+  partialVideoFrame.txMillis = header.timestamp;
+  partialVideoFrame.txClockOffsetMs = txClockOffsetMs;
+  partialVideoFrame.jpegLength = jpegLength;
+  partialVideoFrame.nextOffset = 0;
+  partialVideoFrame.headerWaitUs = headerWaitUs;
+  partialVideoFrame.payloadStartedUs = micros();
+  return true;
+}
+
+static bool finishVideoFrame() {
+  if (!partialVideoFrame.active ||
+      partialVideoFrame.nextOffset != partialVideoFrame.jpegLength) {
+    return false;
+  }
+
+  FrameDescriptor descriptor = {};
+  descriptor.slot = partialVideoFrame.slot;
+  descriptor.frameId = partialVideoFrame.frameId;
+  descriptor.txMillis = partialVideoFrame.txMillis;
+  descriptor.txClockOffsetMs = partialVideoFrame.txClockOffsetMs;
+  descriptor.jpegLength = partialVideoFrame.jpegLength;
+  descriptor.headerWaitUs = partialVideoFrame.headerWaitUs;
+  descriptor.payloadUs = elapsedCounter(micros(), partialVideoFrame.payloadStartedUs);
+  descriptor.enqueuedAtUs = micros();
+  descriptor.terminal = false;
+  if (!enqueueFrameDescriptor(descriptor)) return false;
+
+  partialVideoFrame = {};
+  return true;
+}
+
+static bool appendVideoChunk(const uint8_t *payload, uint16_t payloadLength) {
+  if (!partialVideoFrame.active || payloadLength < 5U) return false;
+
+  const uint32_t offset = moody_audio::readU32BE(payload);
+  const uint32_t chunkLength = static_cast<uint32_t>(payloadLength - 4U);
+  if (!moody_audio::validVideoChunk(partialVideoFrame.jpegLength,
+                                    partialVideoFrame.nextOffset,
+                                    offset,
+                                    chunkLength)) {
+    Serial.println("Invalid VIDEO_CHUNK offset or length");
+    return false;
+  }
+
+  memcpy(jpegBuffers[partialVideoFrame.slot] + offset, payload + 4U, chunkLength);
+  partialVideoFrame.nextOffset += chunkLength;
+  return partialVideoFrame.nextOffset == partialVideoFrame.jpegLength
+    ? finishVideoFrame()
+    : true;
+}
+
+static void recordSequence(const moody_audio::RecordHeader &header) {
+  if (hasExpectedRecordSequence && header.sequence != expectedRecordSequence) {
+    droppedRecordCount += header.sequence - expectedRecordSequence;
+  }
+  expectedRecordSequence = header.sequence + 1U;
+  hasExpectedRecordSequence = true;
+}
+
+static bool readAndDispatchRecord() {
+  uint8_t headerBytes[moody_audio::kRecordHeaderSize];
+  const uint32_t waitStarted = micros();
+  if (!readExact(streamClient, headerBytes, sizeof(headerBytes))) return false;
+
+  const uint32_t headerReceivedAtMs = millis();
+  const uint32_t headerWaitUs = elapsedCounter(micros(), waitStarted);
+  moody_audio::RecordHeader header = {};
+  if (!moody_audio::decodeRecordHeader(headerBytes, sizeof(headerBytes), header)) {
+    Serial.println("Invalid media record header");
+    return false;
+  }
+  recordSequence(header);
+
+  switch (header.type) {
+    case moody_audio::VIDEO_BEGIN: {
+      uint8_t payload[8];
+      return readExact(streamClient, payload, sizeof(payload)) &&
+        beginVideoFrame(header, payload, headerReceivedAtMs, headerWaitUs);
+    }
+    case moody_audio::VIDEO_CHUNK: {
+      uint8_t payload[4U + moody_audio::kMaxVideoChunkLength];
+      return readExact(streamClient, payload, header.payloadLength) &&
+        appendVideoChunk(payload, header.payloadLength);
+    }
+    case moody_audio::AUDIO_PCM: {
+      uint8_t payload[moody_audio::kAudioPayloadLength];
+      if (!readExact(streamClient, payload, sizeof(payload))) return false;
+      // A missing queue or contended producer lock drops audio without ending
+      // the video stream. enqueue() reports the dropped block to its caller.
+      audioPcmQueue.enqueue(header.timestamp, payload);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+static void finishStreamReader() {
+  if (droppedRecordCount != 0U) {
+    Serial.printf("Media record sequence gaps: %lu\n",
+                  static_cast<unsigned long>(droppedRecordCount));
+  }
+  resetConnectionReceiveState();
 
   FrameDescriptor terminal = {};
   terminal.terminal = true;
@@ -515,84 +1212,38 @@ static void finishStreamReader(bool slotHeld, uint8_t slot) {
 }
 
 static void streamReaderTask(void *) {
-  bool hasTxClockOffset = false;
-  uint32_t txClockOffsetMs = 0;
-  bool loggedHeader = false;
-  bool loggedPayload = false;
-
-  while (true) {
-    uint8_t slot = 0;
-    if (xQueueReceive(freeSlots, &slot, portMAX_DELAY) != pdTRUE ||
-        !markSlotAcquired(slot)) {
-      finishStreamReader(false, slot);
-    }
-
-    uint8_t header[16];
-    const uint32_t waitStarted = micros();
-    if (!readExact(streamClient, header, sizeof(header))) {
-      finishStreamReader(true, slot);
-    }
-    const uint32_t headerReceivedAtMs = millis();
-    const uint32_t headerWaitUs = elapsedCounter(micros(), waitStarted);
-
-    if (!loggedHeader) {
-      Serial.println("reader received first frame header");
-      loggedHeader = true;
-    }
-
-    if (memcmp(header, FRAME_MAGIC, sizeof(FRAME_MAGIC)) != 0) {
-      finishStreamReader(true, slot);
-    }
-
-    const uint32_t frameId = readU32BE(header + 4);
-    const uint32_t jpegLength = readU32BE(header + 8);
-    const uint32_t txMillis = readU32BE(header + 12);
-    if (!hasTxClockOffset) {
-      txClockOffsetMs =
-        remoteToLocalCounterOffset(txMillis, headerReceivedAtMs);
-      hasTxClockOffset = true;
-    }
-    if (jpegLength == 0 || jpegLength > MAX_JPEG_SIZE) {
-      Serial.printf("Invalid JPEG length: %lu\n",
-                    static_cast<unsigned long>(jpegLength));
-      finishStreamReader(true, slot);
-    }
-
-    const uint32_t payloadStarted = micros();
-    if (!readExact(streamClient, jpegBuffers[slot], jpegLength)) {
-      finishStreamReader(true, slot);
-    }
-    if (!loggedPayload) {
-      Serial.println("reader received first frame payload");
-      loggedPayload = true;
-    }
-
-    FrameDescriptor descriptor = {};
-    descriptor.slot = slot;
-    descriptor.frameId = frameId;
-    descriptor.txMillis = txMillis;
-    descriptor.txClockOffsetMs = txClockOffsetMs;
-    descriptor.jpegLength = jpegLength;
-    descriptor.headerWaitUs = headerWaitUs;
-    descriptor.payloadUs = elapsedCounter(micros(), payloadStarted);
-    descriptor.enqueuedAtUs = micros();
-    descriptor.terminal = false;
-    if (!enqueueFrameDescriptor(descriptor)) {
-      finishStreamReader(true, slot);
+  uint32_t records = 0;
+  uint32_t lastStackReportAt = millis();
+  while (readAndDispatchRecord()) {
+    ++records;
+    const uint32_t now = millis();
+    if (records == 1 || records == 10 || records == 50 ||
+        now - lastStackReportAt >= 5000) {
+      // ESP-IDF reports this watermark in bytes (minimum unused stack).
+      const uint32_t unusedBytes = uxTaskGetStackHighWaterMark(nullptr);
+      Serial.printf("reader stack: size=%lu unused_min=%lu used_peak=%lu bytes records=%lu\n",
+                    static_cast<unsigned long>(STREAM_READER_STACK_BYTES),
+                    static_cast<unsigned long>(unusedBytes),
+                    static_cast<unsigned long>(STREAM_READER_STACK_BYTES - unusedBytes),
+                    static_cast<unsigned long>(records));
+      lastStackReportAt = now;
     }
   }
+  Serial.println("Media stream ended or contained an invalid record");
+  finishStreamReader();
 }
 
 static bool startStreamReader() {
   if (streamReaderRunning) return true;
 
   xSemaphoreTake(readerFinished, 0);
+  resetConnectionReceiveState();
   if (!resetFrameQueues()) return false;
 
   const BaseType_t created = xTaskCreatePinnedToCore(
     streamReaderTask,
     "stream-reader",
-    4096,
+    STREAM_READER_STACK_BYTES,
     nullptr,
     2,
     nullptr,
@@ -605,12 +1256,13 @@ static bool startStreamReader() {
 }
 
 static void stopStreamReader() {
-  if (!streamReaderRunning) return;
-
-  // A terminal descriptor is enqueued before this completion signal. Waiting
-  // here ensures the old reader has stopped using streamClient before reconnect.
-  xSemaphoreTake(readerFinished, portMAX_DELAY);
-  streamReaderRunning = false;
+  if (streamReaderRunning) {
+    // A terminal descriptor is enqueued before this completion signal. Waiting
+    // here ensures the old reader has stopped using streamClient before reconnect.
+    xSemaphoreTake(readerFinished, portMAX_DELAY);
+    streamReaderRunning = false;
+  }
+  stopAudioPlayback();
 }
 
 static void resetRxTiming(uint32_t now) {
@@ -663,8 +1315,8 @@ static void reportRxTiming() {
 static bool receiveAndDisplayQueuedFrame() {
   static bool loggedDisplay = false;
   FrameDescriptor descriptor = {};
-  if (xQueueReceive(readyFrames, &descriptor, portMAX_DELAY) != pdTRUE) {
-    return false;
+  if (xQueueReceive(readyFrames, &descriptor, pdMS_TO_TICKS(FRAME_WAIT_MS)) != pdTRUE) {
+    return true;  // No frame yet; loop() services touch and waits again.
   }
   if (descriptor.terminal) return false;
 
@@ -698,6 +1350,7 @@ static bool receiveAndDisplayQueuedFrame() {
   rxLcdUs.add(activeLcdUs);
   rxDecodeUs.add(totalUs >= activeLcdUs ? totalUs - activeLcdUs : totalUs);
   rxFrames.record(descriptor.frameId, displayed);
+  if (volumeControl.overlayVisible()) drawVolumeOverlay();
 
   if (!releaseFrameSlot(descriptor.slot)) return false;
 
@@ -709,6 +1362,8 @@ static bool openAuthenticatedStream() {
   ESP_LOGE("moody-rx", "opening authenticated stream");
   showStatus("Connecting", "Contacting moody-tx...", RGB565_CYAN);
   streamClient.stop();
+  resetConnectionReceiveState();
+  if (!resetFrameQueues()) return false;
   streamClient.setNoDelay(true);
   streamClient.setTimeout(IO_TIMEOUT_MS);
 
@@ -725,9 +1380,27 @@ static bool openAuthenticatedStream() {
     return false;
   }
 
+  uint8_t preamble[sizeof(moody_audio::kPreamble)];
+  if (!readExact(streamClient, preamble, sizeof(preamble))) {
+    Serial.println("Could not read transmitter media preamble");
+    streamClient.stop();
+    return false;
+  }
+  if (memcmp(preamble, moody_audio::kPreamble, sizeof(preamble)) != 0) {
+    ESP_LOGE("moody-rx", "incompatible transmitter media protocol");
+    Serial.println("Incompatible transmitter firmware: expected MOODYAV1");
+    showStatus("Incompatible moody-tx", "Update transmitter firmware", RGB565_RED);
+    resetConnectionReceiveState();
+    resetFrameQueues();
+    streamClient.stop();
+    return false;
+  }
+
   gfx->fillScreen(RGB565_BLACK);
   resetRxTiming(millis());
   ESP_LOGE("moody-rx", "stream authenticated");
+  // Audio is optional: codec, I2S, or expander failures leave video active.
+  startAudioPlayback();
   return true;
 }
 
@@ -737,21 +1410,21 @@ void setup() {
   Serial.println("rx setup: serial ready");
   ESP_LOGE("moody-rx", "setup started");
 
-  Wire.begin(I2C_SDA, I2C_SCL);
-  TCA.begin();
-  resetLCD();
+  if (!initialiseBoardIo()) {
+    ESP_LOGE("moody-rx", "board I/O initialisation failed");
+    Serial.println("Fatal: board I/O initialisation failed");
+    while (true) delay(1000);
+  }
   Serial.println("rx setup: display reset complete");
 
-  if (!gfx->begin(LCD_SPI_HZ)) {
+  if (!initialiseDisplay()) {
     ESP_LOGE("moody-rx", "display initialisation failed");
     Serial.println("Fatal: display initialisation failed");
     while (true) delay(1000);
   }
 
-  gfx->setRotation(1);
-  pinMode(LCD_BACKLIGHT, OUTPUT);
-  digitalWrite(LCD_BACKLIGHT, HIGH);
   Serial.println("rx setup: display ready");
+  initialiseTouchVolume();
 
   showStatus("Starting", "Loading paired identity...", RGB565_YELLOW);
 
@@ -786,10 +1459,16 @@ void setup() {
   readyFrames = xQueueCreate(JPEG_SLOT_COUNT, sizeof(FrameDescriptor));
   fifoStateMutex = xSemaphoreCreateMutex();
   readerFinished = xSemaphoreCreateBinary();
+  audioPlaybackFinished = xSemaphoreCreateBinary();
+  audioQueueReady = audioPcmQueue.initialise();
   if (!freeSlots || !readyFrames || !fifoStateMutex || !readerFinished) {
     ESP_LOGE("moody-rx", "FIFO allocation failed");
     showStatus("Fatal error", "No FIFO control memory", RGB565_RED);
     while (true) delay(1000);
+  }
+  if (!audioQueueReady || audioPlaybackFinished == nullptr) {
+    Serial.println("Audio queue unavailable; continuing with video only");
+    audioQueueReady = false;
   }
   Serial.println("rx setup: queues ready");
 
@@ -813,6 +1492,7 @@ void loop() {
     }
 
     if (!startStreamReader()) {
+      stopAudioPlayback();
       streamClient.stop();
       showStatus("Stream unavailable", "Retrying...", RGB565_RED);
       delay(RETRY_DELAY_MS);
@@ -820,6 +1500,7 @@ void loop() {
     }
   }
 
+  serviceVolumeTouch();
   if (!receiveAndDisplayQueuedFrame()) {
     stopStreamReader();
     showStatus("Stream interrupted", "Reconnecting...", RGB565_RED);

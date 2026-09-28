@@ -1,9 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include "driver/i2s.h"
 #include "esp_camera.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "software_jpeg_encoder.h"
+#include "audio_pins.h"
+#include "audio_stream.h"
 
 // The attached USB bridge is wired to UART0; native USB CDC is not exposed.
 #define Serial Serial0
@@ -48,9 +51,20 @@ static const uint8_t TX_HELLO_MAGIC[8] = {'M','O','O','D','Y','T','X','1'};
 static const uint8_t RX_AUTH_MAGIC[8]  = {'M','O','O','D','Y','R','X','1'};
 static const uint8_t AUTH_OK_MAGIC[8]  = {'A','U','T','H','O','K','0','1'};
 static const uint8_t AUTH_FAIL_MAGIC[8]= {'A','U','T','H','N','O','0','1'};
-static const uint8_t FRAME_MAGIC[4]    = {'M','J','P','G'};
 static const char TX_CONTEXT[] = "moody-tx-proof-v1";
 static const char RX_CONTEXT[] = "moody-rx-proof-v1";
+
+static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
+static constexpr size_t AUDIO_SAMPLES_PER_BLOCK = 320;
+static constexpr size_t AUDIO_BLOCK_QUEUE_DEPTH = 4;
+
+struct AudioBlock {
+  uint32_t sampleTimeMs;
+  int16_t samples[320];
+};
+
+static_assert(sizeof(AudioBlock::samples) == moody_audio::kAudioPayloadLength,
+              "Audio blocks must contain 20 ms of 16-bit PCM");
 
 WiFiServer streamServer(STREAM_PORT);
 
@@ -66,6 +80,14 @@ TimingStats txJpegBytes;
 uint32_t txTimingWindowStart = 0;
 bool txUsesSoftwareJpeg = false;
 SoftwareJpegEncoder softwareJpegEncoder;
+
+QueueHandle_t audioBlockQueue = nullptr;
+SemaphoreHandle_t audioQueueMutex = nullptr;
+SemaphoreHandle_t audioCaptureStopped = nullptr;
+TaskHandle_t audioCaptureTask = nullptr;
+volatile bool audioCaptureRunning = false;
+bool audioI2sInstalled = false;
+uint32_t txRecordSequence = 0;
 
 static void writeU16BE(uint8_t out[2], uint16_t value) {
   out[0] = static_cast<uint8_t>(value >> 8);
@@ -114,6 +136,285 @@ static bool readExact(WiFiClient &client, uint8_t *data, size_t length) {
     delay(1);
   }
   return received == length;
+}
+
+static void audioCaptureTaskMain(void *) {
+  int32_t microphoneSlots[AUDIO_SAMPLES_PER_BLOCK];
+  uint32_t pcmReportAt = millis();
+  uint32_t pcmPeak = 0;
+  uint64_t pcmAbsoluteSum = 0;
+  uint32_t pcmSampleCount = 0;
+  uint32_t pcmClippedCount = 0;
+  uint32_t pcmNonzeroCount = 0;
+  uint32_t rawNonzeroCount = 0;
+  uint32_t rawUpperNonzeroCount = 0;
+  uint32_t rawLowerNonzeroCount = 0;
+  uint32_t rawExampleCount = 0;
+  uint32_t rawExamples[4] = {};
+
+  while (audioCaptureRunning) {
+    size_t samplesRead = 0;
+    while (audioCaptureRunning && samplesRead < AUDIO_SAMPLES_PER_BLOCK) {
+      size_t bytesRead = 0;
+      const esp_err_t result = i2s_read(
+        I2S_NUM_0,
+        microphoneSlots + samplesRead,
+        (AUDIO_SAMPLES_PER_BLOCK - samplesRead) * sizeof(microphoneSlots[0]),
+        &bytesRead,
+        pdMS_TO_TICKS(100));
+      if (result != ESP_OK) {
+        if (audioCaptureRunning) {
+          ESP_LOGE("moody-tx", "I2S microphone read failed: 0x%x", result);
+          Serial.printf("I2S microphone read failed: 0x%x\n", result);
+        }
+        samplesRead = 0;
+        break;
+      }
+      if (bytesRead % sizeof(microphoneSlots[0]) != 0) {
+        ESP_LOGE("moody-tx", "I2S microphone read returned %u partial bytes",
+                 static_cast<unsigned>(bytesRead));
+        samplesRead = 0;
+        break;
+      }
+      samplesRead += bytesRead / sizeof(microphoneSlots[0]);
+    }
+
+    if (!audioCaptureRunning) break;
+    if (samplesRead != AUDIO_SAMPLES_PER_BLOCK) continue;
+
+    AudioBlock block = {};
+    block.sampleTimeMs = millis();
+    for (size_t sample = 0; sample < AUDIO_SAMPLES_PER_BLOCK; ++sample) {
+      const uint32_t raw = static_cast<uint32_t>(microphoneSlots[sample]);
+      if (raw != 0) ++rawNonzeroCount;
+      if ((raw >> 16U) != 0) ++rawUpperNonzeroCount;
+      if ((raw & 0xffffU) != 0) ++rawLowerNonzeroCount;
+      // Keep at most four distinct nonzero words; never log the audio buffer.
+      if (raw != 0 && rawExampleCount < 4) {
+        bool seen = false;
+        for (uint32_t i = 0; i < rawExampleCount; ++i) {
+          if (rawExamples[i] == raw) seen = true;
+        }
+        if (!seen) rawExamples[rawExampleCount++] = raw;
+      }
+      // INMP441's signed 24-bit word is left-justified in the 32-bit slot.
+      block.samples[sample] = static_cast<int16_t>(microphoneSlots[sample] >> 16);
+      const int32_t value = block.samples[sample];
+      const uint32_t magnitude = static_cast<uint32_t>(value < 0 ? -value : value);
+      if (magnitude > pcmPeak) pcmPeak = magnitude;
+      pcmAbsoluteSum += magnitude;
+      ++pcmSampleCount;
+      if (value != 0) ++pcmNonzeroCount;
+      if (value == INT16_MIN || value == INT16_MAX) ++pcmClippedCount;
+    }
+
+    // Keep the full-queue replacement atomic with the stream owner's dequeue.
+    // A missed immediate lock simply drops this fresh block; it never disturbs
+    // already queued audio or delays media/socket work.
+    if (xSemaphoreTake(audioQueueMutex, 0) == pdPASS) {
+      if (xQueueSend(audioBlockQueue, &block, 0) != pdPASS) {
+        AudioBlock discarded;
+        xQueueReceive(audioBlockQueue, &discarded, 0);
+        xQueueSend(audioBlockQueue, &block, 0);
+      }
+      xSemaphoreGive(audioQueueMutex);
+    }
+    const uint32_t pcmNow = millis();
+    if (pcmNow - pcmReportAt >= 5000) {
+      Serial.printf("mic PCM: samples=%lu peak=%lu mean_abs=%lu clipped=%lu nonzero=%lu window_ms=%lu\n",
+                    static_cast<unsigned long>(pcmSampleCount),
+                    static_cast<unsigned long>(pcmPeak),
+                    static_cast<unsigned long>(pcmSampleCount ? pcmAbsoluteSum / pcmSampleCount : 0),
+                    static_cast<unsigned long>(pcmClippedCount),
+                    static_cast<unsigned long>(pcmNonzeroCount),
+                    static_cast<unsigned long>(pcmNow - pcmReportAt));
+      Serial.printf("mic raw32: nonzero=%lu upper16_nonzero=%lu lower16_nonzero=%lu examples=%lu %08lx %08lx %08lx %08lx\n",
+                    static_cast<unsigned long>(rawNonzeroCount),
+                    static_cast<unsigned long>(rawUpperNonzeroCount),
+                    static_cast<unsigned long>(rawLowerNonzeroCount),
+                    static_cast<unsigned long>(rawExampleCount),
+                    static_cast<unsigned long>(rawExamples[0]),
+                    static_cast<unsigned long>(rawExamples[1]),
+                    static_cast<unsigned long>(rawExamples[2]),
+                    static_cast<unsigned long>(rawExamples[3]));
+      rawNonzeroCount = rawUpperNonzeroCount = rawLowerNonzeroCount = 0;
+      rawExampleCount = 0;
+      memset(rawExamples, 0, sizeof(rawExamples));
+      pcmReportAt = pcmNow;
+      pcmPeak = pcmSampleCount = pcmClippedCount = pcmNonzeroCount = 0;
+      pcmAbsoluteSum = 0;
+    }
+  }
+
+  // Teardown remains the only owner of the task handle and deletion. Keeping
+  // this task suspended after it reports completion prevents a dual-core race
+  // between task completion and endAudioCapture().
+  xSemaphoreGive(audioCaptureStopped);
+  for (;;) vTaskSuspend(nullptr);
+}
+
+static void endAudioCapture() {
+  audioCaptureRunning = false;
+  if (audioI2sInstalled) {
+    const esp_err_t stopResult = i2s_stop(I2S_NUM_0);
+    if (stopResult != ESP_OK) {
+      ESP_LOGW("moody-tx", "I2S microphone stop returned: 0x%x", stopResult);
+    }
+  }
+  if (audioCaptureTask != nullptr) {
+    // The completion semaphore is created before the task, so a live task
+    // always has a valid join signal. Its read loop has a finite I2S timeout;
+    // wait for that loop to finish before deleting the task or its resources.
+    configASSERT(audioCaptureStopped != nullptr);
+    xSemaphoreTake(audioCaptureStopped, portMAX_DELAY);
+    vTaskDelete(audioCaptureTask);
+    audioCaptureTask = nullptr;
+  }
+  if (audioI2sInstalled) {
+    i2s_driver_uninstall(I2S_NUM_0);
+    audioI2sInstalled = false;
+  }
+  if (audioCaptureStopped != nullptr) {
+    vSemaphoreDelete(audioCaptureStopped);
+    audioCaptureStopped = nullptr;
+  }
+  if (audioQueueMutex != nullptr) {
+    vSemaphoreDelete(audioQueueMutex);
+    audioQueueMutex = nullptr;
+  }
+  if (audioBlockQueue != nullptr) {
+    xQueueReset(audioBlockQueue);
+    vQueueDelete(audioBlockQueue);
+    audioBlockQueue = nullptr;
+  }
+}
+
+static bool beginAudioCapture() {
+  endAudioCapture();
+
+  audioBlockQueue = xQueueCreate(AUDIO_BLOCK_QUEUE_DEPTH, sizeof(AudioBlock));
+  if (audioBlockQueue == nullptr) {
+    ESP_LOGE("moody-tx", "could not allocate microphone block queue");
+    return false;
+  }
+  audioQueueMutex = xSemaphoreCreateMutex();
+  if (audioQueueMutex == nullptr) {
+    ESP_LOGE("moody-tx", "could not allocate microphone queue mutex");
+    endAudioCapture();
+    return false;
+  }
+  audioCaptureStopped = xSemaphoreCreateBinary();
+  if (audioCaptureStopped == nullptr) {
+    ESP_LOGE("moody-tx", "could not allocate microphone task completion semaphore");
+    endAudioCapture();
+    return false;
+  }
+
+  const i2s_config_t config = {
+    .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = AUDIO_SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0,
+  };
+  const i2s_pin_config_t pins = {
+    .mck_io_num = I2S_PIN_NO_CHANGE,
+    .bck_io_num = moody_audio::kMicBclkGpio,
+    .ws_io_num = moody_audio::kMicLrclkGpio,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = moody_audio::kMicDataGpio,
+  };
+
+  esp_err_t result = i2s_driver_install(I2S_NUM_0, &config, 0, nullptr);
+  if (result != ESP_OK) {
+    ESP_LOGE("moody-tx", "I2S microphone install failed: 0x%x", result);
+    Serial.printf("I2S microphone install failed: 0x%x\n", result);
+    endAudioCapture();
+    return false;
+  }
+  audioI2sInstalled = true;
+
+  result = i2s_set_pin(I2S_NUM_0, &pins);
+  if (result != ESP_OK) {
+    ESP_LOGE("moody-tx", "I2S microphone pin setup failed: 0x%x", result);
+    Serial.printf("I2S microphone pin setup failed: 0x%x\n", result);
+    endAudioCapture();
+    return false;
+  }
+
+  audioCaptureRunning = true;
+  if (xTaskCreatePinnedToCore(audioCaptureTaskMain,
+                              "moody-mic",
+                              8192,
+                              nullptr,
+                              1,
+                              &audioCaptureTask,
+                              tskNO_AFFINITY) != pdPASS) {
+    ESP_LOGE("moody-tx", "could not start microphone capture task");
+    Serial.println("Could not start microphone capture task");
+    endAudioCapture();
+    return false;
+  }
+  return true;
+}
+
+static bool tryDequeueAudioBlock(AudioBlock &block) {
+  if (audioQueueMutex == nullptr ||
+      audioBlockQueue == nullptr ||
+      xSemaphoreTake(audioQueueMutex, 0) != pdPASS) {
+    return false;
+  }
+  const bool dequeued = xQueueReceive(audioBlockQueue, &block, 0) == pdPASS;
+  xSemaphoreGive(audioQueueMutex);
+  return dequeued;
+}
+
+static bool sendRecord(WiFiClient &client,
+                       uint8_t type,
+                       uint32_t timestamp,
+                       const uint8_t *payload,
+                       uint16_t payloadLength) {
+  // Submit one complete bounded record per socket write, avoiding a separate
+  // tiny TCP send for every 12-byte header when TCP_NODELAY is enabled.
+  uint8_t recordBytes[moody_audio::kRecordHeaderSize + 4 +
+                      moody_audio::kMaxVideoChunkLength];
+  const moody_audio::RecordHeader header = {
+    type,
+    0,
+    payloadLength,
+    txRecordSequence,
+    timestamp,
+  };
+  if (payloadLength > sizeof(recordBytes) - moody_audio::kRecordHeaderSize ||
+      !moody_audio::encodeRecordHeader(header, recordBytes)) {
+    return false;
+  }
+  memcpy(recordBytes + moody_audio::kRecordHeaderSize, payload, payloadLength);
+  if (!writeAll(client, recordBytes, moody_audio::kRecordHeaderSize + payloadLength)) {
+    return false;
+  }
+  ++txRecordSequence;
+  return true;
+}
+
+static bool sendAudioRecord(WiFiClient &client, const AudioBlock &block) {
+  uint8_t pcm[moody_audio::kAudioPayloadLength];
+  for (size_t sample = 0; sample < AUDIO_SAMPLES_PER_BLOCK; ++sample) {
+    const uint16_t value = static_cast<uint16_t>(block.samples[sample]);
+    pcm[sample * 2] = static_cast<uint8_t>(value);
+    pcm[sample * 2 + 1] = static_cast<uint8_t>(value >> 8);
+  }
+  return sendRecord(client,
+                    moody_audio::AUDIO_PCM,
+                    block.sampleTimeMs,
+                    pcm,
+                    sizeof(pcm));
 }
 
 static bool sha256Parts(const char *context,
@@ -319,23 +620,43 @@ static bool sendFrame(WiFiClient &client, uint32_t frameId) {
   }
 
   txJpegBytes.add(static_cast<uint32_t>(jpegLength));
-
-  uint8_t header[16];
-  memcpy(header, FRAME_MAGIC, sizeof(FRAME_MAGIC));
-  writeU32BE(header + 4, frameId);
-  writeU32BE(header + 8, static_cast<uint32_t>(jpegLength));
-  writeU32BE(header + 12, millis());
-
   const uint32_t sendStarted = micros();
-  if (frameId == 0) Serial.println("first frame: header send start");
-  const bool headerSent = writeAll(client, header, sizeof(header));
-  if (frameId == 0) Serial.println(headerSent
-    ? "first frame: header send complete"
-    : "first frame: header send failed");
-  const bool sent = headerSent && writeAll(client, jpegData, jpegLength);
+  uint8_t beginPayload[8];
+  moody_audio::writeU32BE(frameId, beginPayload);
+  moody_audio::writeU32BE(static_cast<uint32_t>(jpegLength), beginPayload + 4);
+
+  if (frameId == 0) Serial.println("first frame: record send start");
+  bool sent = sendRecord(client,
+                         moody_audio::VIDEO_BEGIN,
+                         millis(),
+                         beginPayload,
+                         sizeof(beginPayload));
+
+  size_t offset = 0;
+  while (sent && offset < jpegLength) {
+    const size_t chunkLength = min(
+      jpegLength - offset,
+      static_cast<size_t>(moody_audio::kMaxVideoChunkLength));
+    uint8_t chunkPayload[4 + moody_audio::kMaxVideoChunkLength];
+    moody_audio::writeU32BE(static_cast<uint32_t>(offset), chunkPayload);
+    memcpy(chunkPayload + 4, jpegData + offset, chunkLength);
+    sent = sendRecord(client,
+                      moody_audio::VIDEO_CHUNK,
+                      millis(),
+                      chunkPayload,
+                      static_cast<uint16_t>(4 + chunkLength));
+    offset += chunkLength;
+
+    // A single audio record after each video chunk bounds time spent sending
+    // one JPEG while preserving the record order owned by this task.
+    AudioBlock block;
+    if (sent && tryDequeueAudioBlock(block)) {
+      sent = sendAudioRecord(client, block);
+    }
+  }
   if (frameId == 0) Serial.println(sent
-    ? "first frame: payload send complete"
-    : "first frame: payload send failed");
+    ? "first frame: record send complete"
+    : "first frame: record send failed");
   txSendUs.add(micros() - sendStarted);
 
   esp_camera_fb_return(frame);
@@ -375,27 +696,59 @@ static void reportTxTiming() {
 }
 
 static void serveClient(WiFiClient client) {
-  client.setNoDelay(true);
+  const int noDelayResult = client.setNoDelay(true);
   client.setTimeout(IO_TIMEOUT_MS);
+  Serial.printf("media TCP: no_delay_set=%d no_delay=%u record_write_max=1040 bytes\n",
+                noDelayResult, static_cast<unsigned>(client.getNoDelay()));
 
   Serial.printf("Client connected from %s\n", client.remoteIP().toString().c_str());
 
   if (!authenticateReceiver(client)) {
     Serial.println("Receiver authentication failed");
+    endAudioCapture();
     client.stop();
     return;
   }
 
-  Serial.println("moody-rx authenticated; starting video");
+  if (!writeAll(client, moody_audio::kPreamble, sizeof(moody_audio::kPreamble))) {
+    Serial.println("Could not send MOODYAV1 preamble");
+    endAudioCapture();
+    client.stop();
+    return;
+  }
+
+  txRecordSequence = 0;
+  if (beginAudioCapture()) {
+    Serial.println("audio=enabled");
+  } else {
+    Serial.println("audio=disabled");
+  }
+
+  Serial.println("moody-rx authenticated; starting media stream");
   uint32_t frameId = 0;
   uint32_t nextFrameAt = millis();
   resetTxTiming(nextFrameAt);
+  bool streaming = true;
 
-  while (client.connected()) {
-    const int32_t waitMs = static_cast<int32_t>(nextFrameAt - millis());
-    if (waitMs > 0) delay(waitMs);
+  while (streaming && client.connected()) {
+    while (client.connected() &&
+           static_cast<int32_t>(nextFrameAt - millis()) > 0) {
+      AudioBlock block;
+      if (tryDequeueAudioBlock(block)) {
+        if (!sendAudioRecord(client, block)) {
+          streaming = false;
+          break;
+        }
+        continue;
+      }
+      delay(1);
+    }
+    if (!streaming || !client.connected()) break;
 
-    if (!sendFrame(client, frameId++)) break;
+    if (!sendFrame(client, frameId++)) {
+      streaming = false;
+      break;
+    }
     reportTxTiming();
     nextFrameAt += FRAME_INTERVAL_MS;
 
@@ -407,6 +760,7 @@ static void serveClient(WiFiClient client) {
     }
   }
 
+  endAudioCapture();
   client.stop();
   Serial.println("Receiver disconnected");
 }
